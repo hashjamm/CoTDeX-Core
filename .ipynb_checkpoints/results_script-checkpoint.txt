@@ -1,0 +1,29 @@
+sas에서 전달된 내용들: 
+ - target_diseases (단독)
+ - outcome_dt_year (년도별)
+ - kcd6 (단독)
+ - std_pop4 (단독)
+ 
+ctable_generator:
+ - edge_pids (년도별)
+ - full_ctable (년도별)
+ - cut_ctable (년도별)
+ 
+node_edge_info_generator:
+ - node_pids_info (단독/node)
+ - edge_pids_info (년도별/edge)
+ 
+rr_calculator:
+ - stat_cut_result (년도별/edge)
+ 
+s_d_calculator:
+ - sd_result (년도별/node)
+ 
+최종 결과물들:
+ - sd_result (년도별/node) -> 웹 기능에 따라 변동되는 결과이기 때문에 함수화
+ - edge_pids_info (년도별/edge) -> 변동 없음
+ - node_pids_info (단독/node) -> 변동 없음
+ - stat_cut_result (년도별/edge) -> 변동 없음
+ 
+ => stat_cut_result에 edge_pids_info를 결합 => cauase_abb에 node_pids_info 결합 + outcome_abb이 node_pids_info 결합 => final_result (년도별/edge + 출발 및 도착 node 정보)
+ => sd_result는 사용자가 final_result에서 사용자가 설정한 df에 대해서 능동적으로 바로바로 만들어지도록 해야함

@@ -1,0 +1,390 @@
+﻿
+/* 1. libname 설정 */
+libname raw_jk "D:\NHIS\T1\T1_00";
+libname raw_sb "D:\NHIS\T1\T1_20";
+libname raw_jr "D:\NHIS\T1\T1_30";
+libname raw_cb "D:\NHIS\T1\T1_60";
+libname result "C:\Users\HashJam\Desktop\Studies\Projects\Disease_network\SAS_results\results_20250424";
+libname matched "C:\Users\HashJam\Desktop\Studies\Projects\Disease_network\SAS_results\results_20250424\matched";
+
+
+/* 2. 2003년에 자격 데이터 테이블에 등록된 대상자를 최초 대상자로 우선 선정 */
+
+/* 필요할수도 있는 변수만 선정하여 2003년 대상자 : 1,012,239 */
+/* 기존에는 dth 기록 상관없이 뽑았는데, 문제가 발생하지는 않지만, 이번에는 아예 대상자에서 제거 */
+data result.t1_00_2003; set raw_jk.nhid_jk_2003;
+if dth_ym ^= . then delete;
+keep stnd_y person_id sex age_group sgg ctrb_pt_type_cd;
+run;
+
+proc sort data=result.t1_00_2003 out=result.t1_00_2003 nodupkey; by _all_; run; /* 혹시 있을 중복 데이터 제거 */
+
+proc import datafile="C:\Users\HashJam\Desktop\Studies\Projects\Disease_network\kcd6_table.xlsx"
+    out=result.kcd6
+    dbms=xlsx
+    replace;
+    sheet="Sheet1";
+    getnames=yes;
+run;
+
+data result.kcd6_check; set result.kcd6;
+kcd6_yn = 1;
+keep code kcd6_yn;
+run; /* rows_num = 39,956 */
+
+proc sort data=result.kcd6_check out=result.kcd6_check nodupkey; by code; run; /* rows_num = 21,562  */
+
+%macro import_t1_20_2002_2013;
+
+    %do year = 2002 %to 2013;
+
+        data t1_20_&year; 
+            set raw_sb.nhid_gy20_t1_&year;
+            keep person_id key_seq recu_y recu_fr_dt form_cd dsbjt_cd abb_sick 
+					main_sick sub_sick in_pat_cors_type recn vscn fst_in_pat_dt;
+			abb_sick = put(substr(main_sick, 1, 3), $3.); /* t20의 주상병 맨 앞 세자리 */
+			recu_y = substr(recu_fr_dt, 1, 4); /* 상병마다 기록된 년도만 추출 -> 각 상병이 각 년도에 기록이 있는지 없는지로만 이후에 표시해야하기 때문에 생성 */
+			if prxmatch('/^[A-Za-z][0-9]{2}$/', abb_sick) < 1 then delete; /* abb_sick의 형태 검증 */
+		run;
+
+    %end;
+
+%mend import_t1_20_2002_2013; /* 2002 ~ 2013년에 대한 상병데이터를 필요한 변수들과 함께 가져오기 */
+
+%import_t1_20_2002_2013;
+
+data result.t1_20; 
+set 
+t1_20_2002 t1_20_2003 t1_20_2004 t1_20_2005 t1_20_2006 t1_20_2007
+t1_20_2008 t1_20_2009 t1_20_2010 t1_20_2011 t1_20_2012 t1_20_2013;
+run; 
+
+proc sql;
+create table result.t1_20_kcd6 as
+select *
+from result.t1_20 as a
+left join result.kcd6_check as b
+on a.abb_sick = b.code;
+quit;
+
+data result.t1_20_kcd6; set result.t1_20_kcd6;
+drop code;
+if kcd6_yn=. then kcd6_yn=0;
+run;
+
+proc freq data=result.t1_20_kcd6;
+	tables kcd6_yn;
+run; /* 42,773 개 기록 제거 가능 */
+
+data result.t1_20_filtered; set result.t1_20_kcd6;
+if kcd6_yn=0 then delete;
+run; /* 119,267,452 개 기록 포함*/
+
+proc sql;
+create table result.std_pop0 as /* 최초 대상자들에 대해서만 상병 기록을 붙여서 최초 분석 기준 테이블(std_pop) 생성 */
+select *
+from result.t1_00_2003 as a
+left join result.t1_20_filtered as b
+on a.person_id=b.person_id;
+quit;
+
+proc sort data=result.std_pop0 out=result.std_pop0; by person_id abb_sick recu_fr_dt; run;
+
+proc sort data=result.std_pop0 out=result.std_pop0 nodupkey; by person_id abb_sick recu_y; run;
+/* 각 상병이 각 년도에 기록이 여러 개 있는 경우엔 있는지 없는지만 판단해야하기 때문에 recu_y 에 대해서도 중복 제거 */
+/* 62,800,243 records have been removed : 107,718,086 -> 44,917,843 */
+/* [이전 방식] 62,870,766 records have been removed : 107,830,371 -> 44,959,605 */
+
+data result.std_pop0; set result.std_pop0;
+drop kcd6_yn;
+run;
+
+data result.std_pop1; set result.std_pop0; /* 초기 관찰 기간에 최초로 걸린 상병에 대해서만 네트워크 형성이 필요하기 때문에 2002년, 2003년에 모두 기록이 있는 상병 기록은 제거 */
+where recu_y in ('2002', '2003');
+run;
+
+data result.std_pop2; set result.std_pop1; 
+keep person_id abb_sick del;
+where recu_y = '2002';
+del = 1;
+run;
+
+proc sort data=result.std_pop2 out=result.std_pop2 nodupkey; by _all_; run;
+/* 혹시모를 중복행 제거 : 0 records have been removed : 3,013,312 -> 3,013,312 */
+/* [이전 방식] 혹시모를 중복행 제거 : 0 records have been removed : 3,030,325 -> 3,030,325 */
+
+proc sql;
+create table result.std_pop3 as
+select *
+from result.std_pop1 as a
+left join result.std_pop2 as b
+on a.person_id=b.person_id and a.abb_sick=b.abb_sick;
+quit;
+
+data result.std_pop3; set result.std_pop3;
+if del=1 then delete;
+drop del;
+run; 
+/* 3,794,979 records have been removed : 6,166,192 -> 2,371,213 : 2002년 기록있는 상병 기록 제거 */ 
+/* [이전 방식] 3,815,892 records have been removed : 6,196,418 -> 2,380,526 : 2002년 기록있는 상병 기록 제거 */
+
+proc sort data=result.std_pop3 out=result.std_pop3; by person_id abb_sick recu_fr_dt; run;
+
+proc sort data=result.std_pop3 out=result.std_pop3 nodupkey; by person_id abb_sick; run;
+/* 혹시모를 중복행 제거 : 0 records have been removed : 2,371,213 -> 2,371,213 */
+/* [이전 방식] 혹시모를 중복행 제거 : 0 records have been removed : 2,380,526 -> 2,380,526 */
+
+proc freq data=result.std_pop3;
+	tables abb_sick / out=result.abb_sick_ratio;
+run;
+
+proc sort data=result.abb_sick_ratio out=result.abb_sick_ratio; by descending count; run;
+
+data result.abb_sick_ratio; /* 관찰기간 동안의 상병의 빈도수 확인을 위한 테이블 생성 후 빈도수에 대하여 내림차순 정렬 */
+    set result.abb_sick_ratio;
+    retain cum_freq cum_percent 0;  /* 누적 빈도와 누적 백분율 초기화 */
+    cum_freq + count;  /* 누적 빈도 계산 */
+    cum_percent + percent;  /* 누적 비율 계산 */
+run;
+
+/* 
+1589개의 질병에 대하여 질병 수를 최대한 줄여서 분석이 진행되어야 함
+질병 리스트에 대하여 모두 네트워크에 포함되는 하나의 노드가 될 수 있다고 가정했을 때, 
+해당 노드는 하나의 원인 질병 혹은 하나의 결과 질병이 될 수 있음.
+즉, 모든 질병은 임의의 다른 질병과 contingency table(case*outcome) 을 이룰 수 있는데,
+질병 하나가 case인 경우에 대해서는 case=1, outcome인 경우에 대해서는 outcome=1 인 경우에 최소 빈도수가 10이상이여야 함.
+*/
+
+/* 
+[이전 방식]
+1633개의 질병에 대하여 질병 수를 최대한 줄여서 분석이 진행되어야 함
+질병 리스트에 대하여 모두 네트워크에 포함되는 하나의 노드가 될 수 있다고 가정했을 때, 
+해당 노드는 하나의 원인 질병 혹은 하나의 결과 질병이 될 수 있음.
+즉, 모든 질병은 임의의 다른 질병과 contingency table(case*outcome) 을 이룰 수 있는데,
+질병 하나가 case인 경우에 대해서는 case=1, outcome인 경우에 대해서는 outcome=1 인 경우에 최소 빈도수가 10이상이여야 함.
+*/
+data result.target_diseases; set result.abb_sick_ratio;
+	where count >= 10; /* 1187개 질병 */
+run;
+
+data outcome_fu; set result.std_pop0;
+	fu_check = input(recu_y, 4.) - 2003;
+run;
+
+/* 
+follow up 기간에 따라 각 질병에 대하여 psm을 마무리한 테이블에 left join할 테이블을 미리 만들어 둠
+outcome_fu_&i : person_id abb_sick
+*/
+%macro process_fu;
+
+    %do i = 1 %to 10;
+
+        /* 각 fu_check에 따른 데이터 처리 */
+        data result.outcome_fu_&i;
+            set outcome_fu;
+            if fu_check <= &i and 0 < fu_check;
+            keep person_id abb_sick;
+        run;
+
+        /* 중복 값 제거 */
+        proc sort data=result.outcome_fu_&i out=result.outcome_fu_&i nodupkey;
+            by _all_;
+        run;
+
+    %end;
+
+%mend process_fu;
+
+/* 매크로 실행 */
+%process_fu;
+
+/* 
+follow up 기간이 늘수록 outcome_fu 테이블의 용량이 매우 커지기 때문에
+각 follow up 기간 마다 추가적으로 최초 발생한 상병 기록에 대하여 contingency table을 생성하는 작업을 진행할 예정
+이에 따라 해당 follow up 기간 마다 추가되는 최초 발생 상병 기록 테이블을 생성
+outcome_dt_year_&i : person_id abb_sick
+*/
+%macro process_year_distinct;
+
+    %do i = 1 %to 10;
+
+        /* 각 fu_check에 따른 데이터 처리 */
+        data result.outcome_dt_year_&i;
+            set outcome_fu;
+            if fu_check <= &i and 0 < fu_check;
+            keep person_id abb_sick fu_check;
+        run;
+
+		proc sql;
+		create table result.outcome_dt_year_&i as
+		select *, count(*) as cnt
+		from result.outcome_dt_year_&i
+		group by person_id, abb_sick
+		having fu_check = &i and cnt = 1;
+		quit;
+
+		data result.outcome_dt_year_&i;
+		set result.outcome_dt_year_&i;
+		keep person_id abb_sick;
+		run;
+
+    %end;
+
+%mend process_year_distinct;
+
+/* 매크로 실행 */
+%process_year_distinct;
+
+/* 
+age_group과 sex에 대하여 정해진 psm_ratio에 따라 matching된 테이블을 반환하는 함수
+*/
+%macro run_psm_by_age_sex(target_table, psm_ratio);
+
+		/* exact matching */
+	data control1; set &target_table;
+		call streaminit(777);
+		rnd=rand('uniform');
+		if case=.;
+		keep person_id age_group sex rnd;
+	run;
+
+	proc sort data=control1 out=control2; by age_group sex rnd; run;
+
+	proc rank data=control2 out=control3; by age_group sex; var rnd; ranks rnd_rank; run;
+
+	data control4; set control3;
+		rename person_id=control_id;
+		rnd_rank=floor((rnd_rank-1)/&psm_ratio)+1;
+	run;
+
+	data case1; set &target_table;
+		call streaminit(888);
+		rnd=rand('uniform');
+		if case=1;
+		keep person_id age_group sex rnd;
+	run;
+
+	proc sort data=case1 out=case2; by age_group sex rnd; run;
+
+	proc rank data=case2 out=case3; by age_group sex; var rnd; ranks rnd_rank; run;
+
+	proc sql;
+		create table control5 as
+		select *
+		from case3 as a
+		left join control4 as b on a.age_group=b.age_group and a.sex=b.sex and a.rnd_rank=b.rnd_rank;
+	quit;
+
+	data case4; 
+		set control5;
+		keep person_id age_group sex rnd_rank;
+	run;
+
+	proc sql;
+		create table case5 as
+		select distinct person_id, age_group, sex, count(rnd_rank) as cnt
+		from case4
+		group by person_id;
+	quit;
+
+	data case6; set case5;
+		if cnt=&psm_ratio then pass=1;
+		if cnt^=&psm_ratio then delete;
+		case=1;
+	run;
+
+	proc sql;
+		create table control6 as
+		select a.control_id, a.age_group, a.sex, b.cnt
+		from control5 as a
+		left join case6 as b on a.person_id=b.person_id;
+	quit;
+
+	data control7; set control6;
+		rename control_id=person_id;
+		if cnt=&psm_ratio then pass=1;
+		if cnt^=&psm_ratio then delete;
+		case=0;
+	run;
+
+	data matched (drop=pass cnt); set case6 control7; run;
+
+%mend run_psm_by_age_sex;
+
+/*
+각 질병에 대하여 age_group과 sex에 대하여 exact matching을 진행하고,
+matching이 마무리된 person_id들의 age_group, sex, case 여부 에 대한 정보와 함께 있는
+matched_xx 테이블을 생성
+*/
+%macro psm_by_diseases_list(psm_target_table, psm_ratio);
+
+	proc sql noprint;
+	    select distinct abb_sick into :typelist separated by ' '
+	    from &psm_target_table;
+	quit;
+	
+	 /* 2-2) cause_abb 리스트의 개수 계산 */
+    %let n = %sysfunc(countw(&typelist));  /* 공백으로 구분된 단어 개수 계산 */
+
+    /* 3. 반복문을 통해 cause_abb 리스트의 각 요소에 대한 작업 */
+    %do i = 1 %to &n;
+
+		%let cause_abb = %scan(&typelist, &i);
+		
+		data case_check; set result.std_pop3;
+		where abb_sick = "&cause_abb";
+		case = 1;
+		keep person_id case;
+		run;
+
+		proc sql; 
+		create table result.std_pop4 as
+		select *
+		from result.t1_00_2003 as a
+		left join case_check as b
+		on a.person_id = b.person_id;
+		quit;
+
+		/* exact matching */
+		%run_psm_by_age_sex(result.std_pop4, &psm_ratio);
+
+		data matched.matched_&cause_abb; set matched; run;
+
+	%end;
+
+%mend psm_by_diseases_list;
+
+%psm_by_diseases_list(result.target_diseases, 5);
+
+%macro add_data_into_matched_set(psm_target_table);
+
+	proc sql noprint;
+	    select distinct abb_sick into :typelist separated by ' '
+	    from &psm_target_table;
+	quit;
+	
+	 /* 2-2) cause_abb 리스트의 개수 계산 */
+    %let n = %sysfunc(countw(&typelist));  /* 공백으로 구분된 단어 개수 계산 */
+
+    /* 3. 반복문을 통해 cause_abb 리스트의 각 요소에 대한 작업 */
+    %do i = 1 %to &n;
+
+		%let cause_abb = %scan(&typelist, &i);
+		
+		proc sql;
+		create table matched.matched_&cause_abb as
+		select a.person_id, a.sex, a.age_group, b.sgg, b.ctrb_pt_type_cd, a.case
+		from matched.matched_&cause_abb as a
+		left join result.t1_00_2003 as b
+		on a.person_id = b.person_id;
+		quit;
+
+	%end;
+
+%mend add_data_into_matched_set;
+
+%add_data_into_matched_set(result.target_diseases);
+
+data ex; set raw_jr.nhid_gy30_t1_2002;
+if div_type_cd=3;
+run;

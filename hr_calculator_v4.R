@@ -1,0 +1,575 @@
+# ============================================================================
+# HR Calculator - 최종 아키텍처 v3.0 (하이브리드 모델)
+# ============================================================================
+#
+# 이 스크립트는 수백만 건의 대규모 HR 분석을 위해 메모리 사용을 최적화하고
+# 다중 코어 서버의 성능을 최대한 활용하도록 설계되었습니다.
+#
+# --- 핵심 아키텍처: '하이브리드' 병렬 처리 ---
+#
+# 1. 'Push-down' 병렬 처리:
+#    - 메인 프로세스는 거대한 중간 데이터(base_data)를 생성하지 않고,
+#      처리할 작업 목록(Instruction List)만 관리합니다.
+#    - 각 병렬 작업자(worker)는 자신에게 할당된 (Cause, Outcome) 쌍에
+#      필요한 최소한의 데이터만 처리하여 메모리 사용량을 최소화합니다.
+#
+# 2. '적극적 예열' (Active Warm-up):
+#    - I/O 병목의 주된 원인이었던 거대 공통 데이터('outcome_table')는
+#      분석 시작 시점에 메모리에 '명시적으로' 로드합니다.
+#    - 병렬 작업자들은 이 메모리 객체를 복사받아 사용함으로써,
+#      느린 디스크 I/O를 피하고 RAM 속도로 데이터에 접근합니다.
+#
+# 3. 안정성을 위한 'multisession':
+#    - data.table과의 충돌 및 COW 실패를 원천적으로 방지하기 위해,
+#      메모리를 공유하지 않는 안정적인 'multisession' 방식을 사용합니다.
+#
+# --- 기대 효과 ---
+#
+# - 안정성: 예측 불가능한 메모리 폭발이나 I/O 병목 없이 안정적으로 실행됩니다.
+# - 성능: 공통 데이터는 RAM에서, 개별 데이터는 디스크에서 처리하는
+#         하이브리드 방식으로 CPU가 100% 계산에 집중할 수 있습니다.
+# - 관리성: n_cores 값만 시스템 RAM에 맞게 조절하면 되므로 관리가 용이합니다.
+#
+# ============================================================================
+
+# conda install -c conda-forge r-tidyverse r-survival r-haven r-broom r-arrow r-tidycmprsk r-data.table r-duckdb r-hash r-jsonlite r-pryr
+
+# conda 실패시에만 아래의 것을 시도도
+# install.packages("survival")
+# install.packages("haven")
+# install.packages("dplyr")
+# install.packages("tidyverse")
+# install.packages("broom")
+# install.packages("arrow")
+# install.packages("tidycmprsk")
+# install.packages("data.table")
+# install.packages("duckdb")
+# install.packages("hash")
+# install.packages("jsonlite")
+# install.packages("pryr")
+
+library(survival)
+library(haven)
+library(dplyr)
+library(tidyverse)
+library(broom)
+library(arrow)
+library(tidycmprsk)
+library(glue)
+library(future)
+library(furrr)
+library(progressr)
+library(data.table)  # 메모리 효율적인 데이터 처리
+library(duckdb)      # 디스크 기반 쿼리 엔진
+library(hash)
+library(jsonlite)
+library(pryr)
+
+# --- 경로 설정 ---
+# paths <- list(
+#     matched_sas_folder = "/home/hashjamm/project_data/disease_network/sas_files/hr_project/matched_date/",
+#     matched_parquet_folder = "/home/hashjamm/project_data/disease_network/matched_date_parquet/",
+#     outcome_sas_file = "/home/hashjamm/project_data/disease_network/sas_files/hr_project/hr_std_pop10.sas7bdat",
+#     outcome_parquet_file = "/home/hashjamm/project_data/disease_network/outcome_table.parquet",
+#     results_hr_folder = "/home/hashjamm/results/disease_network/hr_results_final/",
+#     results_mapping_folder = "/home/hashjamm/results/disease_network/hr_mapping_results_final/",
+#     temp_slices_folder = file.path(tempdir(), "edge_slices")
+# )
+
+# --- 하이브리드 방식에서 메모리에 미리 업로드하는 outcome_table 파일이 multisession 감당이 가능한지 판단 ---
+# outcome_data <- read_parquet(file.path(paths$outcome_parquet_file))
+
+# print(pryr::object_size(outcome_data)) # 2.58 kB
+# print(pryr::object_size(dplyr::collect(outcome_data))) # 2.29 GB
+
+# 시스템 RAM: 128 GB
+# outcome_data 크기: 2.3 GB
+# 워커(코어)당 필요 메모리: outcome_data 복사본(2.3 GB) + matched_pop 및 계산용 여유 공간 (약 0.7 GB) ≈ 3 GB
+# 안전 마진을 고려한 가용 RAM: 128 GB * 0.85 (85%) ≈ 108 GB
+# 안전한 코어 수 ≈ 108 GB / (워커당 3 GB) ≈ 36개
+
+# rm(outcome_data) # 메모리 해제해도 뭔가 좀 남는거 같아서 차라리 R을 끄고 다시 키는걸 추천
+# gc()
+
+# ============================================================================
+# 1. 데이터 변환 모듈 (Data Conversion Modules) + sas 파일 parquet 화
+# ============================================================================
+
+# 헬퍼 함수: 데이터 테이블의 모든 컬럼명을 소문자로 변경
+# to_columns_lower <- function(dt) {
+#     # data.table의 setnames를 사용하여 효율적으로 이름 변경
+#     data.table::setnames(dt, tolower(names(dt)))
+#     return(dt)
+# }
+
+# # 범용 SAS → Parquet 변환 함수 (핵심 변환 로직)
+# convert_sas_to_parquet <- function(sas_file_path, parquet_file_path, verbose = TRUE, to_columns_lower = FALSE) {
+#     # SAS 파일 존재 여부 확인
+#     if (!file.exists(sas_file_path)) {
+#         return(list(
+#             success = FALSE,
+#             error = sprintf("❌ SAS 파일이 존재하지 않습니다: %s", sas_file_path)
+#         ))
+#     }
+    
+#     tryCatch({
+#         if (verbose) {
+#             cat(sprintf("🔄 변환 중: %s → %s\n", basename(sas_file_path), basename(parquet_file_path)))
+#         }
+        
+#         # SAS 파일 로드
+#         sas_data <- read_sas(sas_file_path)
+
+#         if (to_columns_lower) {
+#             sas_data <- to_columns_lower(sas_data)
+#         }
+
+#         original_size <- object.size(sas_data) / 1024^2  # MB로 변경
+        
+#         # Parquet으로 저장 (디렉토리는 이미 존재함)
+#         write_parquet(sas_data, parquet_file_path)
+        
+#         # 메모리 해제
+#         rm(sas_data)
+#         gc(verbose = FALSE)
+        
+#         # 파일 크기 비교
+#         parquet_size <- file.size(parquet_file_path) / 1024^2  # MB로 변경
+#         size_saved <- original_size - parquet_size
+        
+#         if (verbose) {
+#             cat(sprintf("    ✓ 완료: %.1f MB → %.1f MB (%.1f%% 절약)\n", 
+#                        original_size, parquet_size, (size_saved/original_size)*100))
+#         }
+        
+#         return(list(
+#             success = TRUE,
+#             skipped = FALSE,
+#             original_size = original_size,
+#             parquet_size = parquet_size,
+#             size_saved = size_saved,
+#             compression_ratio = (size_saved/original_size)*100
+#         ))
+        
+#     }, error = function(e) {
+#         return(list(
+#             success = FALSE,
+#             error = e$message
+#         ))
+#     })
+# }
+
+# # outcome_table을 Parquet으로 변환
+# convert_sas_to_parquet(paths$outcome_sas_file, paths$outcome_parquet_file, to_columns_lower = TRUE)
+
+# # matched_date 파일들을 일괄 Parquet 변환
+# sas_files <- list.files(paths$matched_sas_folder, pattern = "\\.sas7bdat$", full.names = FALSE)
+
+# for (matched_file in sas_files) {
+#     sas_file_path <- file.path(paths$matched_sas_folder, matched_file)
+#     parquet_file <- gsub("\\.sas7bdat$", "\\.parquet", matched_file)
+#     parquet_file_path <- file.path(paths$matched_parquet_folder, parquet_file)
+    
+#     # 범용 변환 함수 사용
+#     convert_sas_to_parquet(sas_file_path, parquet_file_path, verbose = TRUE, to_columns_lower = TRUE)
+# }
+
+# ============================================================================
+# 데이터 확인: outcome_table.parquet과 matched_date_parquet 파일 상위 10개 row 확인
+# ============================================================================
+
+# # outcome_table.parquet 파일 상위 10개 row 확인
+# cat("\n=== outcome_table.parquet 상위 10개 row ===\n")
+# outcome_data <- read_parquet(parquet_outcome_file_path)
+# print(head(outcome_data, 10))
+
+# # matched_date_parquet 폴더의 첫 번째 파일 상위 10개 row 확인
+# matched_parquet_files <- list.files(parquet_matched_folder_path, pattern = "\\.parquet$", full.names = TRUE)
+# if (length(matched_parquet_files) > 0) {
+#     cat("\n=== matched_date_parquet 폴더 첫 번째 파일 상위 10개 row ===\n")
+#     cat(sprintf("파일명: %s\n", basename(matched_parquet_files[1])))
+#     matched_data <- read_parquet(matched_parquet_files[1])
+#     print(head(matched_data, 10))
+# } else {
+#     cat("\n❌ matched_date_parquet 폴더에 parquet 파일이 없습니다.\n")
+# }
+
+# ============================================================================
+# 2. 헬퍼 함수 정의 (Helper Functions) - HR/SHR 분석을 수행하는 함수
+# ============================================================================
+
+# HR 분석 함수 (모듈화)
+perform_hr_analysis <- function(clean_data, fu, cause_abb, outcome_abb) {
+    # Cox 회귀 분석
+    fit_coxph <- coxph(Surv(diff, status == 1) ~ case + strata(matched_id), data = clean_data)
+    
+    res_log_hr <- tidy(fit_coxph)
+    res_hr <- tidy(fit_coxph, exponentiate = TRUE, conf.int = TRUE)
+    
+    # Cox 회귀 결과 정리
+    full_coxph_results <- res_log_hr %>%
+        select(std.error, statistic, p.value, estimate) %>%
+        rename(
+            log_hr_values = estimate,
+            hr_p_values = p.value,
+            log_hr_std = std.error,
+            log_hr_z_values = statistic
+        ) %>%
+        mutate(
+            fu = fu,
+            cause_abb = cause_abb,
+            outcome_abb = outcome_abb,
+            hr_values = res_hr$estimate,
+            hr_lower_cis = res_hr$conf.low,
+            hr_upper_cis = res_hr$conf.high
+        ) %>%
+        select(
+            fu, cause_abb, outcome_abb, hr_values, hr_lower_cis, hr_upper_cis, 
+            log_hr_values, hr_p_values, log_hr_std, log_hr_z_values
+        )
+    
+    # 경쟁위험 분석을 위한 데이터 준비
+    clean_data_crr <- clean_data %>% mutate(
+        status_factor = factor(
+            status,
+            levels = 0:2, 
+            labels = c("censor", "outcome", "death")
+        )
+    )
+    
+    # 경쟁위험 분석
+    fit_crr <- crr(Surv(diff, status_factor) ~ case, data = clean_data_crr)
+    
+    res_log_shr <- tidy(fit_crr)
+    res_shr <- tidy(fit_crr, exponentiate = TRUE, conf.int = TRUE)
+    
+    # 경쟁위험 분석 결과 정리
+    full_crr_results <- res_log_shr %>%
+        select(std.error, statistic, p.value, estimate) %>%
+        rename(
+            log_shr_values = estimate,
+            shr_p_values = p.value,
+            log_shr_std = std.error,
+            log_shr_z_values = statistic
+        ) %>%
+        mutate(
+            shr_values = res_shr$estimate,
+            shr_lower_cis = res_shr$conf.low,
+            shr_upper_cis = res_shr$conf.high
+        ) %>%
+        select(
+            shr_values, shr_lower_cis, shr_upper_cis, log_shr_values, 
+            shr_p_values, log_shr_std, log_shr_z_values
+        )
+    
+    # 최종 결과 반환
+    return(bind_cols(full_coxph_results, full_crr_results))
+}
+
+# ============================================================================
+# 3단계: 핵심 병렬 처리 모듈 (Core Parallel Worker)
+# ============================================================================
+
+# 단일 (Cause, Outcome) 쌍을 처리하는, 병렬 작업자(worker)가 실행할 함수
+process_one_pair <- function(
+    cause_abb, 
+    outcome_abb, 
+    fu, 
+    matched_parquet_folder_path, 
+    # outcome_parquet_file_path, 
+    outcome_data_in_memory, # [변경] 파일 경로 대신 메모리 객체를 직접 받음
+    results_hr_folder_path, 
+    temp_slices_folder_path
+    ) {
+    
+    # data.table 내부 스레딩 비활성화 (future와 충돌 방지)
+    setDTthreads(1)
+
+    # 1. DuckDB로 필요한 최소 데이터만 디스크에서 직접 로드 -> 아예 R 메모리 제로로 진행 
+    # -> 하이브리드 방식을 위한 outcome_data_in_memory 는 R 메모리에 미리 올려두는 식이기에 duckdb_register 일부 사용
+    con <- dbConnect(duckdb::duckdb())
+    on.exit(dbDisconnect(con, shutdown = TRUE)) # 함수 종료 시 항상 DB 연결 해제
+    
+    # 메모리에 있는 outcome_data는 register 사용
+    duckdb_register(con, "outcome_table_in_memory", outcome_data_in_memory)
+
+    # 디스크에 있는 matched_pop은 SQL에서 직접 read_parquet
+    matched_parquet_file_path <- file.path(matched_parquet_folder_path, sprintf("matched_%s.parquet", tolower(cause_abb)))
+
+    # Outcome이 발생한 사람과 그렇지 않은 사람을 모두 포함하기 위해 LEFT JOIN 사용
+    query <- glue::glue("
+        SELECT m.*, o.recu_fr_dt, o.abb_sick, o.key_seq AS outcome_key_seq
+        FROM read_parquet('{matched_parquet_file_path}') AS m
+        LEFT JOIN (
+            SELECT person_id, recu_fr_dt, abb_sick, key_seq 
+            FROM outcome_table_in_memory 
+            WHERE abb_sick = '{tolower(outcome_abb)}'
+        ) AS o ON m.person_id = o.person_id
+    ")
+    
+    # 1. DuckDB 결과를 표준 data.frame으로 명시적 변환 (느린 변환 문제 회피)
+    result_df <- as.data.frame(dbGetQuery(con, query))
+
+    # 2. 표준 data.frame을 data.table로 변환 (빠르고 메모리 효율적)
+    clean_data <- as.data.table(result_df)
+
+    # 3. 임시 객체인 result_df는 즉시 메모리에서 제거
+    rm(result_df)
+
+    # 2. 데이터 전처리 (시간 계산 등)
+    clean_data[, `:=`(
+        index_date = as.IDate(index_date, format = "%Y%m%d"),
+        death_date = as.IDate(paste0(dth_ym, "15"), format = "%Y%m%d"),
+        end_date = as.IDate(paste0(2003 + fu, "1231"), format = "%Y%m%d"),
+        event_date = as.IDate(recu_fr_dt, format = "%Y%m%d")
+    )]
+    
+    # final_date 및 status 계산 (정확한 로직 적용)
+    clean_data[, final_date := fifelse(
+        !is.na(event_date),
+        pmin(event_date, end_date, na.rm = TRUE),
+        pmin(death_date, end_date, na.rm = TRUE)
+    )]
+    clean_data[, status := fifelse(
+        !is.na(event_date),
+        fifelse(event_date <= final_date, 1, 0), 
+        fifelse(!is.na(death_date) & death_date <= final_date, 2, 0)
+    )]
+    
+    clean_data[, diff := final_date - index_date]
+    
+    # diff < 0 인 matched_id 그룹 전체 제거
+    problem_ids <- clean_data[diff < 0, unique(matched_id)]
+    if (length(problem_ids) > 0) {
+        clean_data <- clean_data[!matched_id %in% problem_ids]
+    }
+    
+    # 3. HR 분석 수행 및 최종 결과 저장 (Scatter)
+    hr_result <- perform_hr_analysis(clean_data, fu, cause_abb, outcome_abb)
+    filename_hr <- sprintf("hr_%s_%s_%d.parquet", cause_abb, outcome_abb, fu)
+    write_parquet(hr_result, file.path(results_hr_folder_path, filename_hr))
+
+    cat(sprintf("    ✓ HR Result Saved: %s\n", filename_hr))
+
+    # 4. Edge 매핑 데이터 조각 생성 및 임시 파일로 저장 (Scatter)
+    key <- paste(cause_abb, outcome_abb, fu, sep = "_")
+    
+    # diff < 0 제거 후 남은 'case' 그룹에 대해서만 정보 수집
+    edge_slice <- list(
+        pids = clean_data[case == 1, .(person_id)],
+        index_key_seq = clean_data[case == 1, .(index_key_seq)],
+        key_seq = clean_data[case == 1 & status == 1, .(outcome_key_seq)]
+    )
+    
+    # 고유한 임시 파일 이름 생성 및 저장
+    slice_filename <- sprintf("edge_slice_%s.rds", digest::digest(key))
+    saveRDS(list(key = key, data = edge_slice), file.path(temp_slices_folder_path, slice_filename))
+
+    cat(sprintf("    ✓ Mapping Slice Saved: %s\n", slice_filename))
+    
+    return(TRUE)
+}
+
+# ============================================================================
+# 4. 메인 실행 함수 (Main Executor)
+# ============================================================================
+
+run_hr_analysis <- function(
+    cause_list, 
+    outcome_list, 
+    fu, 
+    n_cores,
+    matched_parquet_folder_path, 
+    outcome_parquet_file_path, # 메모리 로드용 (워커에서는 사용하지 않음)
+    results_hr_folder_path, 
+    temp_slices_folder_path
+    ) {
+    cat("\n--- [단계 1] 핵심 병렬 분석 시작 (하이브리드 모드: 메모리에 outcome_data만 올려서 공통 데이터로 사용)---\n")
+    
+    # [추가] 공통 데이터(outcome_table)를 미리 메모리에 로드 (적극적 예열)
+    cat("공통 데이터(outcome_table)를 메모리에 로드 중...\n")
+    # arrow의 Lazy Evaluation을 피하고 실제 메모리 객체로 가져옴
+    outcome_data_in_memory <- dplyr::collect(read_parquet(outcome_parquet_file_path))
+    cat(sprintf("메모리 로드 완료: %.2f GiB\n", object.size(outcome_data_in_memory) / 1024^3))
+    total_memory_needed <- object.size(outcome_data_in_memory) * n_cores / 1024^3
+    cat(sprintf("공통데이터에 의한 멀티세션 부하 메모리: %.2f GiB\n", total_memory_needed))
+
+    # --- 작업 목록 생성 ---
+    instruction_list <- tidyr::expand_grid(cause_abb = cause_list, outcome_abb = outcome_list) %>%
+        filter(cause_abb != outcome_abb)
+    cat(sprintf("총 %d개 조합 분석 시작 (Core: %d)\n", nrow(instruction_list), n_cores))
+    
+    # --- 병렬 처리 설정 및 실행 ---
+    # future 패키지의 전역 변수 크기 제한을 늘림 (기본값: 500MB -> 제한 제거)
+    options(future.globals.maxSize = Inf)  
+    plan(multisession, workers = n_cores)
+    required_packages <- c("data.table", "duckdb", "arrow", "survival", "broom", "tidycmprsk", "dplyr", "glue", "digest")
+    
+    progressr::with_progress({
+        p <- progressr::progressor(steps = nrow(instruction_list))
+        
+        future_walk(1:nrow(instruction_list), function(i) {
+            current_cause <- instruction_list$cause_abb[i]
+            current_outcome <- instruction_list$outcome_abb[i]
+            
+            tryCatch({
+                process_one_pair(
+                    current_cause, current_outcome, fu,
+                    matched_parquet_folder_path,
+                    # outcome_parquet_file_path,
+                    outcome_data_in_memory,
+                    results_hr_folder_path,
+                    temp_slices_folder_path
+                )
+            }, error = function(e) {
+                cat(sprintf("\nERROR in %s -> %s: %s\n", current_cause, current_outcome, e$message))
+            })
+            p()
+        }, .options = furrr_options(seed = TRUE, packages = required_packages, globals = "outcome_data_in_memory"))
+    })
+    
+    plan(sequential)
+    cat("\n--- [단계 1] 핵심 병렬 분석 완료 ---\n")
+}
+
+# ============================================================================
+# 5. 데이터 취합 함수 (Data Aggregator)
+# ============================================================================
+
+aggregate_mappings <- function(
+    cause_list,
+    fu, 
+    matched_parquet_folder_path, 
+    results_mapping_folder_path,
+    temp_slices_folder_path
+    ) {
+    cat("\n--- [단계 2] 최종 매핑 데이터 취합 시작 ---\n")
+    # --- Node 매핑 데이터 생성 ---
+    cat("1. Node 매핑 데이터 생성 중...\n")
+    node_pids_list <- list()
+    node_index_key_seq_list <- list()
+    
+    for (cause_abb in cause_list) {
+        key <- paste(cause_abb, fu, sep = "_")
+        matched_path <- file.path(matched_parquet_folder_path, sprintf("matched_%s.parquet", tolower(cause_abb)))
+        if (file.exists(matched_path)) {
+            matched_data <- read_parquet(matched_path, col_select = c("person_id", "index_key_seq", "case"))
+            node_pids_list[[key]] <- matched_data$person_id
+            node_index_key_seq_list[[key]] <- matched_data$index_key_seq[matched_data$case == 1]
+        }
+    }
+    save_mapping_to_parquet(node_pids_list, "node_pids", results_mapping_folder_path, fu)
+    save_mapping_to_parquet(node_index_key_seq_list, "node_index_key_seq", results_mapping_folder_path, fu)
+    rm(node_pids_list, node_index_key_seq_list); gc()
+
+    # --- Edge 매핑 데이터 취합 ---
+    cat("\n2. Edge 매핑 데이터 취합 중...\n")
+    edge_pids_list <- list()
+    edge_index_key_seq_list <- list()
+    edge_key_seq_list <- list()
+    
+    slice_files <- list.files(temp_slices_folder_path, full.names = TRUE, pattern = "\\.rds$")
+    cat(sprintf("%d개의 Edge 데이터 조각을 취합합니다.\n", length(slice_files)))
+    
+    if (length(slice_files) > 0) {
+        progressr::with_progress({
+            p <- progressr::progressor(steps = length(slice_files))
+            for (slice_file in slice_files) {
+                slice <- readRDS(slice_file)
+                key <- slice$key
+                edge_pids_list[[key]] <- unlist(slice$data$pids, use.names = FALSE)
+                edge_index_key_seq_list[[key]] <- unlist(slice$data$index_key_seq, use.names = FALSE)
+                edge_key_seq_list[[key]] <- unlist(slice$data$key_seq, use.names = FALSE)
+                p()
+            }
+        })
+    }
+    
+    save_mapping_to_parquet(edge_pids_list, "edge_pids", results_mapping_folder_path, fu)
+    save_mapping_to_parquet(edge_index_key_seq_list, "edge_index_key_seq", results_mapping_folder_path, fu)
+    save_mapping_to_parquet(edge_key_seq_list, "edge_key_seq", results_mapping_folder_path, fu)
+    rm(edge_pids_list, edge_index_key_seq_list, edge_key_seq_list); gc()
+    
+    cat("--- [단계 2] 최종 매핑 데이터 취합 완료 ---\n")
+}
+
+# R 리스트를 Parquet으로 저장하는 재사용 가능한 헬퍼 함수
+save_mapping_to_parquet <- function(mapping_list, type, output_dir, fu) {
+    if (length(mapping_list) == 0) {
+        cat(sprintf("   - '%s' 매핑 데이터가 없어 건너뜁니다.\n", type))
+        return()
+    }
+    
+    cat(sprintf("   - '%s' 매핑 저장 중...\n", type))
+    
+    # 리스트를 key-value 데이터프레임으로 변환
+    df <- data.frame(
+        key = names(mapping_list),
+        stringsAsFactors = FALSE
+    )
+    df$values <- I(mapping_list) # 리스트 구조를 유지하며 컬럼에 삽입
+    
+    # Parquet 파일로 저장
+    parquet_file <- file.path(output_dir, sprintf("%s_mapping_%d.parquet", type, fu))
+    arrow::write_parquet(df, parquet_file)
+    
+    cat(sprintf("     ✓ 완료: %s\n", basename(parquet_file)))
+}
+
+# ============================================================================
+# 6. 스크립트 실행 (Script Execution)
+# ============================================================================
+
+# 질병 코드 목록을 가져오는 유틸리티 함수
+get_disease_codes_from_path <- function(matched_parquet_folder_path) {
+    codes <- toupper(gsub("matched_(.*)\\.parquet", "\\1", list.files(matched_parquet_folder_path)))
+    return(sort(codes))
+}
+
+paths <- list(
+        matched_sas_folder = "/home/hashjamm/project_data/disease_network/sas_files/hr_project/matched_date/",
+        matched_parquet_folder = "/home/hashjamm/project_data/disease_network/matched_date_parquet/",
+        outcome_sas_file = "/home/hashjamm/project_data/disease_network/sas_files/hr_project/hr_std_pop10.sas7bdat",
+        outcome_parquet_file = "/home/hashjamm/project_data/disease_network/outcome_table.parquet",
+        results_hr_folder = "/home/hashjamm/results/disease_network/hr_results_final/",
+        results_mapping_folder = "/home/hashjamm/results/disease_network/hr_mapping_results_final/",
+        temp_slices_folder = file.path(tempdir(), "edge_slices")
+    )
+
+handlers(handler_progress(format = "[:bar] :current/:total (:percent) | ETA: :eta"))
+
+# 메인 실행 함수
+main <- function(paths = paths, fu, n_cores = 90) {
+    
+    total_start_time <- Sys.time()
+    
+    # --- 실행 순서 ---
+    
+    # 1. 전체 질병 코드 리스트 가져오기
+    disease_codes <- get_disease_codes_from_path(file.path(paths$matched_parquet_folder))
+    
+    # 2. 핵심 병렬 분석 실행
+    run_hr_analysis(
+        disease_codes, disease_codes, fu, n_cores,
+        matched_parquet_folder_path = paths$matched_parquet_folder,
+        outcome_parquet_file_path = paths$outcome_parquet_file,
+        results_hr_folder_path = paths$results_hr_folder,
+        temp_slices_folder_path = paths$temp_slices_folder
+    )
+    
+    # 3. 최종 데이터 취합
+    aggregate_mappings(
+        disease_codes, fu,
+        matched_parquet_folder_path = paths$matched_parquet_folder,
+        results_mapping_folder_path = paths$results_mapping_folder,
+        temp_slices_folder_path = paths$temp_slices_folder
+    )
+    
+    # --- 최종 요약 ---
+    total_elapsed <- as.numeric(difftime(Sys.time(), total_start_time, units = "hours"))
+    cat(sprintf("\n모든 작업 완료! 총 소요 시간: %.2f시간 (%.1f일)\n", total_elapsed, total_elapsed/24))
+    cat(sprintf("HR 결과물 위치: %s\n", paths$results_hr_folder))
+    cat(sprintf("매핑 결과물 위치: %s\n", paths$results_mapping_folder))
+}
+
+main(paths = paths, fu = 10, n_cores = 4)

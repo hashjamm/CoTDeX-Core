@@ -190,3 +190,127 @@
 - 연도별 RR 기반 directed weighted disease network 생성
 - 질병 간 구조적 연결성, 중심 질병군, 클러스터 분석 수행
 - 사용자 조건 기반 탐색 가능한 웹 시각화 도구 구현
+
+
+## 10. HR(Hazard Ratio) 분석 시스템 개발 (2025-12-15)
+
+### 10.1 기초 인프라 구축
+
+- **유틸리티 모듈 업데이트** (`disease_network_funs.py`)
+  - RR 단계 작업을 위한 함수 추가 (DBver_melting_edge_attr 등)
+  - RR mapping 관련 데이터 처리 함수
+  - 여러 노트북에서 공통으로 사용하는 헬퍼 함수들 확장
+
+- **데이터베이스 마이그레이션**
+  - `DBver_info_merging_migration.ipynb`: 건기식 서비스 제공을 위한 별도 DB 마이그레이션, Primary Key 작업 및 최적화
+  - `latte_migration.ipynb`: Latte 시스템 데이터 변환 및 마이그레이션
+
+- **외부 협업 노트북**
+  - `datacook_20251021.ipynb`, `supple_grouping_result_20250825.ipynb`: 데이터쿡 협업 - 건기식 전처리 및 supplementary_disease_network 생성
+  - `datachang_data_summary.ipynb`: 데이터창 협업 - 데이터 분석 및 전달
+
+### 10.2 HR Calculator 단독 로직 개발 (v1-v10)
+
+- **초기 버전 (v1-v3)**
+  - 기본 HR 분석 로직 구현 (Cox 회귀, 경쟁위험 분석)
+  - 데이터 전처리 개선 (날짜 변환, NA 처리, 데이터 검증)
+  - 에러 핸들링 및 로깅 개선
+
+- **성능 최적화 (v4)**
+  - OS 디스크 캐시 예열 방식 도입
+  - 메모리 제로 전략 (Push-down 병렬 처리)
+  - 안정적인 multisession 방식 사용
+
+- **fu=10 작업 시도 및 문제 해결 (v5-v10)**
+  - **v5**: fu=10 작업 첫 시도 - RAM 병목 문제 발생, aggregate 실패로 청크 파일 소실
+  - **v6-v7**: RAM 병목 문제 해결 시도
+    - v6: COW + RAM 조인 방식 시도
+    - v7: DuckDB I/O로 전환하여 RAM 병목 해결
+  - **v8-v9**: 트랜잭션 통합 및 3-Tier Logging 추가
+    - 트랜잭션 통합으로 부분 작업 실패 시 전체 롤백 가능
+    - 성공/시스템 실패/통계 실패 로그 3단계 분리
+  - **v10**: 최종 안정화 버전 - v5의 결과물을 기반으로 복구 작업 수행
+
+### 10.3 HR 자동화 시스템 개발
+
+- **HR Calculator Engine (v1-v5)**
+  - **v1**: 자동화 엔진 기본 구현 (배치 처리, 병렬 처리, DuckDB 기반 저장, 청크 파일 시스템)
+  - **v2**: 메모리 사용량 최적화 (DuckDB COPY 방식 시도, aggregate 실패 시 데이터 소실 위험 발견)
+  - **v3**: 데이터 소실 방지 개선 (aggregate 로직 별도 분리, 청크 파일 삭제 로직 제거)
+  - **v4**: stat_excluded 기능 추가 (fu=9 작업에 사용, case=1 & status=1이 없는 경우 처리)
+  - **v5**: 매핑 데이터 제외 버전 (통계 결과 데이터 수집에만 집중, fu=7 작업부터 사용)
+
+- **실행 관리 시스템**
+  - `hr_analysis_manager.sh`: 범용 실행 관리 스크립트
+    - R 스크립트 이름과 fu 인자만 변경하여 사용
+    - 자동 재시작 기능, 진행 상황 모니터링 (프로그래스 바)
+    - 메모리 제한 설정 (100G), 시스템 리소스 모니터링
+
+- **결과물 취합 및 검증**
+  - `aggregate_results.R`: 청크 파일 취합 Standalone 스크립트 (메모리 문제로 메인 프로세스에서 분리)
+  - `compare_old_new_files.R`: 데이터 생성 방식 검증 스크립트
+
+### 10.4 모니터링 시스템 개발
+
+- **실시간 모니터링 대시보드** (`tmux_monitor_advanced.py`)
+  - Flask 기반 웹 모니터링 대시보드
+  - 실시간 로그 스트리밍, 진행 상황 모니터링, 에러 통계 및 분석
+  - DuckDB 기반 작업 완료/실패 추적
+
+- **동적 프로젝트 전환 기능**
+  - 서버 재시작 없이 프로젝트 전환 가능
+  - 전역 프로젝트 설정 관리
+
+- **유틸리티 스크립트**
+  - `open_monitor.sh`: 모니터링 대시보드 실행 스크립트
+  - `setup_firewall.sh`: 방화벽 설정 스크립트 (포트 5000)
+
+### 10.5 RR Mapping 검증 시스템 개발 (fu=8 완료 후, fu=7 이전)
+
+- **디버깅 도구**
+  - `hr_rr_mapping_validation_engine_debug.R`: 초기 디버깅 스크립트
+  - `hr_rr_mapping_validation_engine_error_locator.R`: 에러 위치 파악 스크립트 (24개 인디케이터를 통한 단계별 추적)
+
+- **RR Mapping Validation Engine (v1-v3)**
+  - HR Engine에서 diff < 0인 경우 제거된 매핑 데이터 수집
+  - negative_edge_pids 매핑 데이터 저장
+  - 청크 파일 관리 개선, 로그 청크 파일 병합 후 삭제
+
+- **실행 관리 시스템**
+  - `hr_rr_mapping_validation_manager_v1.sh`, `v2.sh`: 자동 재시작 기능, 진행 상황 모니터링
+
+- **데이터 탐색 노트북**
+  - `rr_pids_keyseq_add_after_hr_engine.ipynb`: fu=8 작업 진행 전 RR mapping 산출 과정에서 사용
+
+### 10.6 fu=10 데이터 복구 시스템 (aggregate 실패 후)
+
+- **데이터 무결성 검증** (`v10_verify_to_build_recover_20251110.R`)
+  - HR 결과, Stat Failed, System Failed, Completed Jobs 쌍 비교 분석
+  - 네 집합 간 겹침 분석, 데이터 일관성 검증
+
+- **파일시스템 레벨 복구 시도** (`recover_deleted_chunks.sh`)
+  - extundelete를 사용한 삭제된 DuckDB 청크 파일 복구 시도
+  - 파일시스템 레벨 복구가 불가능하여 v5 청크에서 복구 방식으로 전환
+
+- **v5 청크에서 v10 데이터 복구** (`hr_fu10_recover.R`)
+  - hr_calculator_v5.R의 결과물(청크 파일)에서 v10에 필요한 조합쌍만 추출
+  - HR 분석 없이 매핑 데이터만 생성 (map_chunk_*.duckdb)
+
+- **복구 검증** (`hr_fu10_recovered_mapping_check.R`)
+  - 복구된 매핑 데이터의 무결성 검증
+  - v10 HR 결과와 복구된 매핑 데이터의 조합쌍 일치 여부 확인
+
+### 10.7 작업 순서 및 진행 상황
+
+- **fu=10**: hr_calculator_v5.R (단독) → aggregate 실패 → 복구 → hr_calculator_v10.R
+- **fu=9**: hr_analysis_manager.sh + engine_v4 (stat_excluded 추가)
+- **fu=8**: 진행 전 RR mapping 산출 → hr_analysis_manager.sh + engine_v4
+- **fu=7**: fu=8 완료 후 validation 진행 → hr_analysis_manager.sh + engine_v5 (mapping 제외)
+
+### 10.8 주요 성과
+
+- **대규모 HR 분석 자동화 시스템 구축**: 140만 개 질병 쌍에 대한 HR 분석을 자동화하여 처리 성능을 크게 향상
+- **견고한 데이터 처리 시스템**: 이어하기(Resumability) 기능, 3-Tier Logging, 트랜잭션 통합을 통한 데이터 무결성 보장
+- **실시간 모니터링 시스템**: 웹 기반 대시보드를 통한 작업 진행 상황 실시간 추적
+- **데이터 복구 시스템**: aggregate 실패로 인한 데이터 소실 문제를 해결하고 복구 시스템 구축
+- **RR Mapping 검증 시스템**: HR 분석 과정에서 제거된 매핑 데이터를 수집하여 데이터 완전성 확보

@@ -4,3 +4,10 @@ e.l
 *.pkl
 *.zip
 *.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
